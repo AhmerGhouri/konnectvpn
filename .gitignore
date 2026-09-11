@@ -73,3 +73,13 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Config
+src/config/vpnConfig.ts
+
+# Router Config
+src/config/routerConfig.ts
+
+
+# VPN .conf files
+src/vpn_countries/
