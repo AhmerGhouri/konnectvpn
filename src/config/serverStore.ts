@@ -99,3 +99,48 @@ export async function appendImportedServer(
     throw err;
   }
 }
+
+/**
+ * Removes a specific imported server entry from storage / Keychain.
+ */
+export async function removeImportedServer(serverId: string): Promise<void> {
+  try {
+    const raw = await AsyncStorage.getItem(IMPORTED_SERVERS_KEY);
+    if (raw) {
+      const records: ImportedRecord[] = JSON.parse(raw);
+      const filtered = records.filter((r) => r.server.id !== serverId);
+      await AsyncStorage.setItem(IMPORTED_SERVERS_KEY, JSON.stringify(filtered));
+    }
+
+    const rawConfigs = await AsyncStorage.getItem('konnectvpn_imported_configs');
+    if (rawConfigs) {
+      const configs = JSON.parse(rawConfigs);
+      if (configs[serverId]) {
+        delete configs[serverId];
+        await AsyncStorage.setItem('konnectvpn_imported_configs', JSON.stringify(configs));
+      }
+    }
+
+    console.log(`[serverStore] ✅ Removed server "${serverId}" from Keychain.`);
+  } catch (err) {
+    console.error(`[serverStore] Failed to remove server "${serverId}":`, err);
+    throw err;
+  }
+}
+
+/**
+ * Removes all imported server entries and cached configurations from storage / Keychain.
+ */
+export async function clearImportedServers(): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(IMPORTED_SERVERS_KEY);
+    await AsyncStorage.removeItem('konnectvpn_imported_configs');
+    await AsyncStorage.removeItem('konnectvpn_preprovisioned_servers');
+    await AsyncStorage.removeItem('konnectvpn_last_connected_server');
+    console.log('[serverStore] ✅ Successfully cleared all server entries from Keychain.');
+  } catch (err) {
+    console.error('[serverStore] Failed to clear imported servers:', err);
+    throw err;
+  }
+}
+

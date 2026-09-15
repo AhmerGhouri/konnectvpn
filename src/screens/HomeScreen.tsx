@@ -20,6 +20,7 @@ import {
   Animated,
   Modal,
   ScrollView,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
@@ -36,6 +37,7 @@ import {
 } from '../api/routerClient';
 import {
   getAllCountries,
+  clearImportedServers,
   type CountryWithServers,
 } from '../config/serverStore';
 import {
@@ -104,7 +106,15 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
 
   const pollStatus = useCallback(async () => {
     const result = await getConnectionStatus();
-    setStatus(result);
+    setStatus((prev) => {
+      if (!prev) return result;
+      const prevId = prev.kind === 'connected' || prev.kind === 'disconnected' ? prev.activeServer?.id : null;
+      const nextId = result.kind === 'connected' || result.kind === 'disconnected' ? result.activeServer?.id : null;
+      if (prev.kind === result.kind && prevId === nextId) {
+        return prev; // Maintain reference to avoid triggering full component re-render
+      }
+      return result;
+    });
 
     if (result.kind === 'authError') {
       setStatusMessage('Session expired — tap to sign in again');
@@ -315,13 +325,39 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
     }
   }, []);
 
+  const handleClearServers = useCallback(() => {
+    setShowSettings(false);
+    Alert.alert(
+      'Clear Server Entries from Keychain',
+      'This will remove all imported servers, cached configurations, and provision tracking from the Keychain. Bundled servers will remain.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear All',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await clearImportedServers();
+              const updated = await getAllCountries();
+              setCountriesList(updated);
+              setStatusMessage('Keychain server cache cleared');
+              Alert.alert('Success', 'Server entries removed from Keychain.');
+            } catch (err: any) {
+              Alert.alert('Error', err?.message || 'Failed to clear server entries');
+            }
+          },
+        },
+      ],
+    );
+  }, []);
+
   // Derived state for toggle button
   const isConnected = status?.kind === 'connected';
   const buttonStateText = isActionInFlight
     ? 'Connecting...'
     : isConnected
-    ? 'Connected'
-    : 'Not Connected';
+      ? 'Connected'
+      : 'Not Connected';
 
   // Active server label calculation
   let activeLocationText = 'Choose a location';
@@ -355,8 +391,22 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
       {/* Settings Popover */}
       {showSettings && (
         <View style={styles.settingsDropdown}>
+          <Pressable
+            style={styles.settingsItemBtn}
+            onPress={() => {
+              setShowSettings(false);
+              onOpenAdmin();
+            }}
+          >
+            <Text style={styles.settingsItemText}>📥 Import Server (.conf)</Text>
+          </Pressable>
+          <View style={styles.dropdownDivider} />
           <Pressable style={styles.settingsItemBtn} onPress={handleBatchProvision}>
             <Text style={styles.settingsItemText}>⚡ Sync All Servers to Router</Text>
+          </Pressable>
+          <View style={styles.dropdownDivider} />
+          <Pressable style={styles.settingsItemBtn} onPress={handleClearServers}>
+            <Text style={styles.settingsItemText}>🗑️ Clear Servers from Keychain</Text>
           </Pressable>
           <View style={styles.dropdownDivider} />
           <Pressable style={styles.signOutBtn} onPress={handleSignOut}>

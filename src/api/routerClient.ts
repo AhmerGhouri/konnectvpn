@@ -1,7 +1,9 @@
 // src/api/routerClient.ts
 //
 // Networking layer for the MikroTik router REST API.
-// All communication is plain HTTP over the LAN — see vpnConfig.ts for why.
+// Implements Single-Policy Overwrite Architecture (wg-konnect).
+// Exactly one WireGuard interface, one peer, one address, one NAT rule, and 3 routes.
+// Switching servers overwrites the configuration in place with zero policy conflicts.
 
 import * as Keychain from 'react-native-keychain';
 import {
@@ -17,10 +19,20 @@ import {
 import { getAllCountries, appendImportedServer } from '../config/serverStore';
 import { AsyncStorage } from '../utils/storage';
 import { computeNetworkAndGateway } from '../utils/subnetMath';
-import { getNextListenPort } from '../utils/listenPortRegistry';
-import type { ParsedWireGuardConfig } from '../utils/wireguardConfigParser';
+import { ALL_BUNDLED_SERVERS } from '../vpn_countries';
+import { parseWireGuardConfig, type ParsedWireGuardConfig } from '../utils/wireguardConfigParser';
 
 const LAST_CONNECTED_SERVER_KEY = 'konnectvpn_last_connected_server';
+const IMPORTED_CONFIGS_KEY = 'konnectvpn_imported_configs';
+
+export const KONNECT_WG_INTERFACE = 'wg-konnect';
+export const KONNECT_PORT = '13231';
+export const KONNECT_MTU = '1420';
+export const KONNECT_NAT_COMMENT = 'konnect-vpn-nat';
+export const KONNECT_SPLIT1_COMMENT = 'konnect-vpn-split1';
+export const KONNECT_SPLIT2_COMMENT = 'konnect-vpn-split2';
+export const KONNECT_ENDPOINT_COMMENT = 'konnect-vpn-endpoint';
+export const KONNECT_ADDR_COMMENT = 'konnect-vpn-address';
 
 // ---------------------------------------------------------------------------
 // Error types — the UI switches on these to show the right plain-language copy
@@ -61,7 +73,7 @@ export class RouterScriptError extends Error {
 // ---------------------------------------------------------------------------
 
 export type ConnectionStatus =
-  | { kind: 'connected'; activeServer: ServerEntry; lastHandshakeSecondsAgo: number }
+  | { kind: 'connected'; activeServer: ServerEntry; lastHandshakeSecondsAgo: number | null }
   | { kind: 'disconnected'; activeServer: ServerEntry | null; lastHandshakeSecondsAgo: number | null }
   | { kind: 'unreachable' }
   | { kind: 'authError' };
@@ -94,13 +106,11 @@ function getUrlEmbeddedCredentials(): { username: string; password: string } | n
 
 /** Read credentials from the config or iOS Keychain. */
 async function getStoredCredentials(): Promise<{ username: string; password: string } | null> {
-  // 1. Check if configured in vpnConfig.ts
   const embedded = getUrlEmbeddedCredentials();
   if (embedded) {
     return embedded;
   }
 
-  // 2. Otherwise read from Keychain
   const result = await Keychain.getGenericPassword({ service: 'konnectvpn-router' });
   if (result === false) {
     return null;
@@ -112,7 +122,7 @@ async function getStoredCredentials(): Promise<{ username: string; password: str
  * Reliable base64 encoder that doesn't depend on Hermes's btoa.
  * Handles all Latin-1 characters correctly.
  */
-function base64Encode(input: string): string {
+export function base64Encode(input: string): string {
   const chars =
     'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let output = '';
@@ -155,15 +165,10 @@ async function routerFetch(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
-  // Clean base URL and extract/apply credentials
   const credsToUse = credentials || await getStoredCredentials() || undefined;
-
-  // Strip any existing credentials from ROUTER_BASE_URL to form clean base
   const cleanBaseUrl = ROUTER_BASE_URL.replace(/^(https?:\/\/)[^@]+@/, '$1');
-
   const fullUrl = `${cleanBaseUrl}${path}`;
 
-  // Set Authorization and Cache-Control headers
   const combinedHeaders: Record<string, string> = {
     'Cache-Control': 'no-cache, no-store, must-revalidate',
     Pragma: 'no-cache',
@@ -204,21 +209,34 @@ function isItemDisabled(item: any): boolean {
   return item?.disabled === true || item?.disabled === 'true';
 }
 
+/** Return the active, non-VPN default gateway used to reach Proton endpoints. */
+function getWanDefaultGateway(routes: any[]): string | null {
+  const route = routes.find((r) =>
+    r['dst-address'] === '0.0.0.0/0' &&
+    !isItemDisabled(r) &&
+    String(r.comment || '').indexOf('vpn-') !== 0 &&
+    String(r.comment || '').indexOf('konnect-') !== 0 &&
+    typeof r.gateway === 'string' &&
+    r.gateway.trim() !== '',
+  );
+  return route ? String(route.gateway) : null;
+}
+
 // ---------------------------------------------------------------------------
-// MikroTik peer response shape (the fields we actually use)
+// MikroTik peer response shape
 // ---------------------------------------------------------------------------
 
 interface MikroTikPeer {
   '.id': string;
   interface: string;
-  'last-handshake': string; // e.g. "1m23s" or "" if never
+  'last-handshake': string;
   disabled?: boolean | string;
   [key: string]: unknown;
 }
 
 /**
  * Parse MikroTik's duration format ("1m23s", "45s", "0s", "2h3m", etc.) into seconds.
- * Returns null if the string is empty or unparseable (means no handshake ever).
+ * Returns null if the string is empty or unparseable.
  */
 function parseMikroTikDuration(duration: string): number | null {
   if (!duration || duration.trim() === '') {
@@ -244,6 +262,72 @@ function parseMikroTikDuration(duration: string): number | null {
   }
 
   return hasMatch ? seconds : null;
+}
+
+/**
+ * Retrieve parsed WireGuard configuration for any serverId (bundled or imported).
+ */
+export async function getServerWireGuardConfig(serverId: string): Promise<ParsedWireGuardConfig | null> {
+  // 1. Direct exact match in bundled servers
+  let bundled = ALL_BUNDLED_SERVERS.find((s) => s.serverId === serverId);
+
+  // 2. Normalized match (e.g. 'uk-endinburg-2' vs 'uk-edinburgh-2')
+  if (!bundled) {
+    const norm = serverId.toLowerCase().replace(/[^a-z0-9]/g, '');
+    bundled = ALL_BUNDLED_SERVERS.find(
+      (s) => s.serverId.toLowerCase().replace(/[^a-z0-9]/g, '') === norm,
+    );
+  }
+
+  // 3. Known aliases
+  if (!bundled) {
+    if (serverId.includes('edinburg') || serverId.includes('edinburgh')) {
+      bundled = ALL_BUNDLED_SERVERS.find((s) => s.serverId.includes('edinburg') || s.serverId.includes('edinburgh'));
+    } else if (serverId.includes('london')) {
+      bundled = ALL_BUNDLED_SERVERS.find((s) => s.serverId.includes('london'));
+    }
+  }
+
+  if (bundled) {
+    try {
+      return parseWireGuardConfig(bundled.rawConf);
+    } catch (err) {
+      console.error(`[getServerWireGuardConfig] Failed to parse bundled conf for ${serverId}:`, err);
+    }
+  }
+
+  // 4. Check imported configurations from local storage
+  try {
+    const raw = await AsyncStorage.getItem(IMPORTED_CONFIGS_KEY);
+    if (raw) {
+      const map: Record<string, string> = JSON.parse(raw);
+      if (map[serverId]) {
+        return parseWireGuardConfig(map[serverId]);
+      }
+      const lower = serverId.toLowerCase();
+      for (const [k, v] of Object.entries(map)) {
+        if (k.toLowerCase() === lower || k.toLowerCase().replace(/[^a-z0-9]/g, '') === lower.replace(/[^a-z0-9]/g, '')) {
+          return parseWireGuardConfig(v);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[getServerWireGuardConfig] Failed to load imported conf for ${serverId}:`, err);
+  }
+
+  // 5. Fallback by country prefix (e.g. 'uk-something' -> first available UK server)
+  const prefix = serverId.split('-')[0].toLowerCase();
+  const countryFallback = ALL_BUNDLED_SERVERS.find(
+    (s) => s.countryCode.toLowerCase() === prefix || s.serverId.toLowerCase().startsWith(prefix),
+  );
+  if (countryFallback) {
+    console.warn(`[getServerWireGuardConfig] Server "${serverId}" not matched, falling back to ${countryFallback.serverId}`);
+    try {
+      return parseWireGuardConfig(countryFallback.rawConf);
+    } catch { }
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,9 +369,7 @@ export async function validateCredentials(
     '/rest/interface/wireguard/peers',
     {
       method: 'GET',
-      headers: {
-        Accept: 'application/json',
-      },
+      headers: { Accept: 'application/json' },
     },
     { username, password },
   );
@@ -298,9 +380,9 @@ export async function validateCredentials(
 }
 
 /**
- * Tell the router to switch the active VPN server.
- * Enables interface, peer, IP address, NAT rule, and policy split routes for the target server.
- * Disables other VPN routes, interfaces, and NAT rules.
+ * Switch active VPN server using Single-Policy Overwrite Architecture.
+ * Overwrites wg-konnect interface, single peer, IP address, NAT rule, and 3 routes.
+ * Zero competing interfaces or port conflicts.
  */
 export async function switchServer(serverId: string): Promise<void> {
   const creds = await getStoredCredentials();
@@ -308,245 +390,394 @@ export async function switchServer(serverId: string): Promise<void> {
     throw new RouterAuthError();
   }
 
-  console.log('[switchServer] Attempting to switch to serverId:', serverId);
-  const targetIfName = `wg-${serverId}`;
+  console.log('[switchServer] Overwriting single-policy with server:', serverId);
 
-  // 1. Manage WireGuard interfaces: enable target wg-<serverId> and disable other wg-* interfaces
-  try {
-    const ifacesRes = await routerFetch('/rest/interface/wireguard', { method: 'GET' }, creds);
-    if (ifacesRes.ok) {
-      const ifaces: any[] = await ifacesRes.json();
-      for (const iface of ifaces) {
-        const isTarget = iface.name === targetIfName;
-        const isAppWg = String(iface.name || '').startsWith('wg-');
-        if (isTarget && isItemDisabled(iface)) {
-          console.log(`[switchServer] Enabling interface ${iface.name}`);
-          await routerFetch(
-            `/rest/interface/wireguard/${iface['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'false' }),
-            },
-            creds,
-          );
-        } else if (!isTarget && isAppWg && !isItemDisabled(iface)) {
-          console.log(`[switchServer] Disabling interface ${iface.name}`);
-          await routerFetch(
-            `/rest/interface/wireguard/${iface['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'true' }),
-            },
-            creds,
-          );
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('[switchServer] Interface state update warning:', err);
+  // 1. Retrieve WireGuard config
+  const config = await getServerWireGuardConfig(serverId);
+  if (!config) {
+    throw new RouterScriptError(`Configuration for server "${serverId}" not found. Please sync servers or re-import.`);
   }
 
-  // 2. Manage WireGuard peers: ensure peer for target interface is enabled, disable other app peers
-  try {
-    const peersRes = await routerFetch('/rest/interface/wireguard/peers', { method: 'GET' }, creds);
-    if (peersRes.ok) {
-      const peerList: any[] = await peersRes.json();
-      for (const p of peerList) {
-        const isTargetPeer = p.interface === targetIfName || p.comment === serverId;
-        const isAppPeer = String(p.interface || '').startsWith('wg-');
-        if (isTargetPeer && isItemDisabled(p)) {
-          console.log(`[switchServer] Enabling peer ${p['.id']} for ${targetIfName}`);
-          await routerFetch(
-            `/rest/interface/wireguard/peers/${p['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'false' }),
-            },
-            creds,
-          );
-        } else if (isAppPeer && !isTargetPeer && !isItemDisabled(p)) {
-          console.log(`[switchServer] Disabling other peer ${p['.id']} for ${p.interface}`);
-          await routerFetch(
-            `/rest/interface/wireguard/peers/${p['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'true' }),
-            },
-            creds,
-          );
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('[switchServer] Peer state update warning:', err);
-  }
+  const { network } = computeNetworkAndGateway(config.address, config.dns);
 
-  // 3. Manage IP Address: ensure address on target interface is enabled, disable other wg- addresses
-  try {
-    const addrRes = await routerFetch('/rest/ip/address', { method: 'GET' }, creds);
-    if (addrRes.ok) {
-      const addrList: any[] = await addrRes.json();
-      for (const a of addrList) {
-        const isTargetAddr = a.interface === targetIfName;
-        const isAppAddr = String(a.interface || '').startsWith('wg-');
-        if (isTargetAddr && isItemDisabled(a)) {
-          console.log(`[switchServer] Enabling IP address for ${targetIfName}`);
-          await routerFetch(
-            `/rest/ip/address/${a['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'false' }),
-            },
-            creds,
-          );
-        } else if (isAppAddr && !isTargetAddr && !isItemDisabled(a)) {
-          console.log(`[switchServer] Disabling other WireGuard IP address ${a['.id']} for ${a.interface}`);
-          await routerFetch(
-            `/rest/ip/address/${a['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'true' }),
-            },
-            creds,
-          );
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('[switchServer] IP address state update warning:', err);
-  }
-
-  // 4. Manage Firewall NAT: enable NAT for target server, disable other vpn-nat-*
-  try {
-    const natRes = await routerFetch('/rest/ip/firewall/nat', { method: 'GET' }, creds);
-    if (natRes.ok) {
-      const natList: any[] = await natRes.json();
-      for (const nat of natList) {
-        const comment = String(nat.comment || '');
-        const isTargetNat = comment === `vpn-nat-${serverId}` || nat['out-interface'] === targetIfName;
-        if (isTargetNat && isItemDisabled(nat)) {
-          console.log(`[switchServer] Enabling NAT rule for ${targetIfName}`);
-          await routerFetch(
-            `/rest/ip/firewall/nat/${nat['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'false' }),
-            },
-            creds,
-          );
-        } else if (comment.startsWith('vpn-nat-') && !isTargetNat && !isItemDisabled(nat)) {
-          console.log(`[switchServer] Disabling other NAT rule ${nat['.id']}`);
-          await routerFetch(
-            `/rest/ip/firewall/nat/${nat['.id']}`,
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ disabled: 'true' }),
-            },
-            creds,
-          );
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('[switchServer] NAT state update warning:', err);
-  }
-
-  // 4b. Disable 'Local Route' NAT rule so traffic goes through VPN tunnel
-  try {
-    const natRes2 = await routerFetch('/rest/ip/firewall/nat', { method: 'GET' }, creds);
-    if (natRes2.ok) {
-      const natList2: any[] = await natRes2.json();
-      const localRoute = natList2.find(
-        (n: any) =>
-          String(n.comment || '') === 'Local Route' &&
-          String(n.chain || '') === 'srcnat',
-      );
-      if (localRoute && !isItemDisabled(localRoute)) {
-        await routerFetch(
-          `/rest/ip/firewall/nat/${localRoute['.id']}`,
-          {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ disabled: 'true' }),
-          },
-          creds,
-        );
-        console.log('[switchServer] Disabled Local Route NAT rule');
-      }
-    }
-  } catch (err) {
-    console.warn('[switchServer] Local Route disable warning:', err);
-  }
-
-  // 5. Fetch all routes and enable target server routes, disable other vpn routes
+  // 2. Discover WAN default gateway for the endpoint route
   const routesRes = await routerFetch('/rest/ip/route', { method: 'GET' }, creds);
   if (!routesRes.ok) {
     throw new RouterScriptError(`Failed to fetch routes: HTTP ${routesRes.status}`);
   }
   const routes: any[] = await routesRes.json();
+  const wanGateway = getWanDefaultGateway(routes);
+  if (!wanGateway) {
+    throw new RouterScriptError('Could not find an active WAN default route. Ensure router is connected to the internet.');
+  }
 
+  // 3. Overwrite / Ensure WireGuard Interface (wg-konnect)
+  const ifacesRes = await routerFetch('/rest/interface/wireguard', { method: 'GET' }, creds);
+  const ifaces: any[] = ifacesRes.ok ? await ifacesRes.json() : [];
+  const mainIface = ifaces.find((i) => i.name === KONNECT_WG_INTERFACE);
+
+  // Disable any legacy wg-* interfaces that might exist
+  for (const iface of ifaces) {
+    const isLegacy = iface.name !== KONNECT_WG_INTERFACE && String(iface.name || '').startsWith('wg-');
+    if (isLegacy && !isItemDisabled(iface)) {
+      console.log(`[switchServer] Disabling legacy interface ${iface.name}`);
+      await routerFetch(
+        `/rest/interface/wireguard/${iface['.id']}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabled: 'true' }),
+        },
+        creds,
+      );
+    }
+  }
+
+  if (mainIface) {
+    console.log(`[switchServer] Updating interface ${KONNECT_WG_INTERFACE} (${mainIface['.id']})`);
+    await routerFetch(
+      `/rest/interface/wireguard/${mainIface['.id']}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          'private-key': config.privateKey,
+          'listen-port': KONNECT_PORT,
+          mtu: KONNECT_MTU,
+          comment: serverId,
+          disabled: 'false',
+        }),
+      },
+      creds,
+    );
+  } else {
+    console.log(`[switchServer] Creating interface ${KONNECT_WG_INTERFACE}`);
+    const createRes = await routerFetch(
+      '/rest/interface/wireguard',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: KONNECT_WG_INTERFACE,
+          'private-key': config.privateKey,
+          'listen-port': KONNECT_PORT,
+          mtu: KONNECT_MTU,
+          comment: serverId,
+          disabled: 'false',
+        }),
+      },
+      creds,
+    );
+    if (!createRes.ok) {
+      throw new RouterScriptError(`Failed to create interface ${KONNECT_WG_INTERFACE}: HTTP ${createRes.status}`);
+    }
+  }
+
+  // 4. Overwrite / Ensure WireGuard Peer on wg-konnect
+  const peersRes = await routerFetch('/rest/interface/wireguard/peers', { method: 'GET' }, creds);
+  const peers: any[] = peersRes.ok ? await peersRes.json() : [];
+  const mainPeer = peers.find((p) => p.interface === KONNECT_WG_INTERFACE);
+
+  // Disable any legacy peers on other wg- interfaces
+  for (const p of peers) {
+    if (p.interface !== KONNECT_WG_INTERFACE && String(p.interface || '').startsWith('wg-') && !isItemDisabled(p)) {
+      await routerFetch(
+        `/rest/interface/wireguard/peers/${p['.id']}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabled: 'true' }),
+        },
+        creds,
+      );
+    }
+  }
+
+  const peerPayload = {
+    interface: KONNECT_WG_INTERFACE,
+    'public-key': config.publicKey,
+    'endpoint-address': config.endpointAddress,
+    'endpoint-port': String(config.endpointPort),
+    'allowed-address': '0.0.0.0/0,::/0',
+    'persistent-keepalive': '25s',
+    comment: serverId,
+    disabled: 'false',
+  };
+
+  if (mainPeer) {
+    console.log(`[switchServer] Updating peer on ${KONNECT_WG_INTERFACE} (${mainPeer['.id']})`);
+    await routerFetch(
+      `/rest/interface/wireguard/peers/${mainPeer['.id']}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(peerPayload),
+      },
+      creds,
+    );
+  } else {
+    console.log(`[switchServer] Creating peer on ${KONNECT_WG_INTERFACE}`);
+    await routerFetch(
+      '/rest/interface/wireguard/peers',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(peerPayload),
+      },
+      creds,
+    );
+  }
+
+  // 5. Overwrite / Ensure IP Address on wg-konnect
+  const addrsRes = await routerFetch('/rest/ip/address', { method: 'GET' }, creds);
+  const addrs: any[] = addrsRes.ok ? await addrsRes.json() : [];
+  const mainAddr = addrs.find((a) => a.interface === KONNECT_WG_INTERFACE);
+
+  // Disable any legacy addresses
+  for (const a of addrs) {
+    if (a.interface !== KONNECT_WG_INTERFACE && String(a.interface || '').startsWith('wg-') && !isItemDisabled(a)) {
+      await routerFetch(
+        `/rest/ip/address/${a['.id']}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabled: 'true' }),
+        },
+        creds,
+      );
+    }
+  }
+
+  const addrPayload = {
+    interface: KONNECT_WG_INTERFACE,
+    address: config.address,
+    network: network,
+    comment: KONNECT_ADDR_COMMENT,
+    disabled: 'false',
+  };
+
+  if (mainAddr) {
+    console.log(`[switchServer] Updating IP address on ${KONNECT_WG_INTERFACE} (${mainAddr['.id']})`);
+    await routerFetch(
+      `/rest/ip/address/${mainAddr['.id']}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(addrPayload),
+      },
+      creds,
+    );
+  } else {
+    console.log(`[switchServer] Creating IP address on ${KONNECT_WG_INTERFACE}`);
+    await routerFetch(
+      '/rest/ip/address',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(addrPayload),
+      },
+      creds,
+    );
+  }
+
+  // 6. Overwrite / Ensure NAT masquerade rule for wg-konnect
+  const natsRes = await routerFetch('/rest/ip/firewall/nat', { method: 'GET' }, creds);
+  const nats: any[] = natsRes.ok ? await natsRes.json() : [];
+  const mainNat = nats.find(
+    (n) => String(n.comment || '') === KONNECT_NAT_COMMENT || n['out-interface'] === KONNECT_WG_INTERFACE,
+  );
+
+  // Disable legacy NAT rules
+  for (const n of nats) {
+    const comment = String(n.comment || '');
+    const isLegacyVpnNat = comment.startsWith('vpn-nat-') || (comment.includes('vpn') && comment !== KONNECT_NAT_COMMENT);
+    if (isLegacyVpnNat && !isItemDisabled(n)) {
+      await routerFetch(
+        `/rest/ip/firewall/nat/${n['.id']}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabled: 'true' }),
+        },
+        creds,
+      );
+    }
+  }
+
+  if (mainNat) {
+    console.log(`[switchServer] Enabling NAT rule for ${KONNECT_WG_INTERFACE} (${mainNat['.id']})`);
+    await routerFetch(
+      `/rest/ip/firewall/nat/${mainNat['.id']}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled: 'false', 'out-interface': KONNECT_WG_INTERFACE }),
+      },
+      creds,
+    );
+  } else {
+    console.log(`[switchServer] Creating NAT rule for ${KONNECT_WG_INTERFACE}`);
+    await routerFetch(
+      '/rest/ip/firewall/nat',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chain: 'srcnat',
+          action: 'masquerade',
+          'out-interface': KONNECT_WG_INTERFACE,
+          comment: KONNECT_NAT_COMMENT,
+          disabled: 'false',
+        }),
+      },
+      creds,
+    );
+  }
+
+  // Ensure 'Local Route' NAT rule is enabled
+  const localRouteNat = nats.find((n) => String(n.comment || '') === 'Local Route' && String(n.chain || '') === 'srcnat');
+  if (localRouteNat && isItemDisabled(localRouteNat)) {
+    await routerFetch(
+      `/rest/ip/firewall/nat/${localRouteNat['.id']}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled: 'false' }),
+      },
+      creds,
+    );
+  }
+
+  // 7. Overwrite / Ensure Split Policy Routes
+  // Disable any legacy routes
   for (const r of routes) {
     const comment = String(r.comment || '');
-    const isTargetServerRoute =
-      comment === `vpn-split1-${serverId}` ||
-      comment === `vpn-split2-${serverId}` ||
-      comment === `vpn-endpoint-${serverId}`;
-
-    const isOtherVpnRoute = comment.startsWith('vpn-') && !isTargetServerRoute;
-    const isLegacySplitRoute =
+    const isLegacyVpnRoute =
+      (comment.startsWith('vpn-split') || comment.startsWith('vpn-endpoint')) &&
+      comment !== KONNECT_SPLIT1_COMMENT &&
+      comment !== KONNECT_SPLIT2_COMMENT &&
+      comment !== KONNECT_ENDPOINT_COMMENT;
+    const isUntaggedSplit =
       !comment && (r['dst-address'] === '0.0.0.0/1' || r['dst-address'] === '128.0.0.0/1');
+    if ((isLegacyVpnRoute || isUntaggedSplit) && !isItemDisabled(r)) {
+      await routerFetch(
+        `/rest/ip/route/${r['.id']}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabled: 'true' }),
+        },
+        creds,
+      );
+    }
+  }
 
-    if (isTargetServerRoute) {
-      const isSplit = comment.startsWith('vpn-split');
-      const patchBody: Record<string, string> = { disabled: 'false' };
-      if (isSplit && r.gateway !== targetIfName) {
-        patchBody.gateway = targetIfName;
-      }
-      if (isItemDisabled(r) || patchBody.gateway) {
+  // Endpoint exception route must be enabled first so handshake traffic bypasses the tunnel
+  const endpointRoute = routes.find((r) => String(r.comment || '') === KONNECT_ENDPOINT_COMMENT);
+  const endpointPayload = {
+    'dst-address': `${config.endpointAddress}/32`,
+    gateway: wanGateway,
+    comment: KONNECT_ENDPOINT_COMMENT,
+    disabled: 'false',
+  };
+  if (endpointRoute) {
+    await routerFetch(
+      `/rest/ip/route/${endpointRoute['.id']}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(endpointPayload),
+      },
+      creds,
+    );
+  } else {
+    await routerFetch(
+      '/rest/ip/route',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(endpointPayload),
+      },
+      creds,
+    );
+  }
+
+  // Split routes 0.0.0.0/1 and 128.0.0.0/1 pointing to wg-konnect
+  const splitRoutesConfig = [
+    { comment: KONNECT_SPLIT1_COMMENT, 'dst-address': '0.0.0.0/1' },
+    { comment: KONNECT_SPLIT2_COMMENT, 'dst-address': '128.0.0.0/1' },
+  ];
+
+  for (const s of splitRoutesConfig) {
+    const existing = routes.find((r) => String(r.comment || '') === s.comment);
+    const payload = {
+      'dst-address': s['dst-address'],
+      gateway: KONNECT_WG_INTERFACE,
+      comment: s.comment,
+      disabled: 'false',
+    };
+    if (existing) {
+      await routerFetch(
+        `/rest/ip/route/${existing['.id']}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+        creds,
+      );
+    } else {
+      await routerFetch(
+        '/rest/ip/route',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+        creds,
+      );
+    }
+  }
+
+  // 8. Ensure TCP MSS clamping mangle rule exists for MTU 1420
+  try {
+    const mangleRes = await routerFetch('/rest/ip/firewall/mangle', { method: 'GET' }, creds);
+    if (mangleRes.ok) {
+      const mangleList: any[] = await mangleRes.json();
+      const mssRule = mangleList.find((m) => String(m.comment || '') === 'konnect-vpn-mss');
+      if (!mssRule) {
         await routerFetch(
-          `/rest/ip/route/${r['.id']}`,
+          '/rest/ip/firewall/mangle',
           {
-            method: 'PATCH',
+            method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(patchBody),
-          },
-          creds,
-        );
-      }
-    } else if (isOtherVpnRoute || isLegacySplitRoute) {
-      if (!isItemDisabled(r)) {
-        await routerFetch(
-          `/rest/ip/route/${r['.id']}`,
-          {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ disabled: 'true' }),
+            body: JSON.stringify({
+              chain: 'forward',
+              action: 'change-mss',
+              'new-mss': 'clamp-to-pmtu',
+              passthrough: 'yes',
+              protocol: 'tcp',
+              'tcp-flags': 'syn',
+              'out-interface': KONNECT_WG_INTERFACE,
+              comment: 'konnect-vpn-mss',
+            }),
           },
           creds,
         );
       }
     }
+  } catch {
+    // Non-fatal
   }
 
-  // 6. Trigger handshake immediately by pinging 1.1.1.1 through the router
+  // 9. Trigger handshake immediately by pinging WireGuard gateway
   try {
     await routerFetch(
       '/rest/ping',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          address: '1.1.1.1',
-          count: '2',
-        }),
+        body: JSON.stringify({ address: '10.2.0.1', count: '1' }),
       },
       creds,
     );
@@ -554,14 +785,15 @@ export async function switchServer(serverId: string): Promise<void> {
     // Non-fatal handshake trigger
   }
 
-  // Persist as last connected server
+  // 10. Persist last connected server ID
   await AsyncStorage.setItem(LAST_CONNECTED_SERVER_KEY, serverId);
+  console.log(`[switchServer] ✅ Successfully switched to server ${serverId}`);
 }
 
 /**
- * Tell the router to disconnect VPN and revert routing to direct internet.
- * Disables all active VPN split routes and VPN NAT rules.
- * Note: Keeps last connected server preserved so one-tap reconnect works.
+ * Disconnect VPN and revert routing to direct internet.
+ * Disables split routes, wg-konnect interface, peer, address, and NAT rule.
+ * Direct internet via WAN route takes over immediately.
  */
 export async function disconnectVpn(): Promise<void> {
   const creds = await getStoredCredentials();
@@ -569,41 +801,48 @@ export async function disconnectVpn(): Promise<void> {
     throw new RouterAuthError();
   }
 
-  console.log('[disconnectVpn] Disconnecting VPN and reverting to direct internet');
+  console.log('[disconnectVpn] Disabling VPN policy and reverting to direct internet');
 
-  // 1. Disable all vpn- tagged routes and legacy split routes
-  const routesRes = await routerFetch('/rest/ip/route', { method: 'GET' }, creds);
-  if (routesRes.ok) {
-    const routes: any[] = await routesRes.json();
-    for (const r of routes) {
-      const comment = String(r.comment || '');
-      const isVpnRoute =
-        comment.startsWith('vpn-') ||
-        r['dst-address'] === '0.0.0.0/1' ||
-        r['dst-address'] === '128.0.0.0/1';
+  // 1. Disable split routes and endpoint exception route
+  try {
+    const routesRes = await routerFetch('/rest/ip/route', { method: 'GET' }, creds);
+    if (routesRes.ok) {
+      const routes: any[] = await routesRes.json();
+      for (const r of routes) {
+        const comment = String(r.comment || '');
+        const isVpnRoute =
+          comment === KONNECT_SPLIT1_COMMENT ||
+          comment === KONNECT_SPLIT2_COMMENT ||
+          comment === KONNECT_ENDPOINT_COMMENT ||
+          comment.startsWith('vpn-') ||
+          comment.startsWith('konnect-vpn-') ||
+          r['dst-address'] === '0.0.0.0/1' ||
+          r['dst-address'] === '128.0.0.0/1';
 
-      if (isVpnRoute && !isItemDisabled(r)) {
-        await routerFetch(
-          `/rest/ip/route/${r['.id']}`,
-          {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ disabled: 'true' }),
-          },
-          creds,
-        );
+        if (isVpnRoute && !isItemDisabled(r)) {
+          await routerFetch(
+            `/rest/ip/route/${r['.id']}`,
+            {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ disabled: 'true' }),
+            },
+            creds,
+          );
+        }
       }
     }
+  } catch (err) {
+    console.warn('[disconnectVpn] Routes disable warning:', err);
   }
 
-  // 2. Disable all app-provisioned WireGuard interfaces (wg-*) to stop tunnel keepalives
+  // 2. Disable wg-konnect and any legacy wg- interfaces
   try {
     const ifacesRes = await routerFetch('/rest/interface/wireguard', { method: 'GET' }, creds);
     if (ifacesRes.ok) {
       const ifaces: any[] = await ifacesRes.json();
       for (const iface of ifaces) {
-        const isAppProvisioned = String(iface.name || '').startsWith('wg-');
-        if (isAppProvisioned && !isItemDisabled(iface)) {
+        if (String(iface.name || '').startsWith('wg-') && !isItemDisabled(iface)) {
           await routerFetch(
             `/rest/interface/wireguard/${iface['.id']}`,
             {
@@ -620,14 +859,14 @@ export async function disconnectVpn(): Promise<void> {
     console.warn('[disconnectVpn] Interface disable warning:', err);
   }
 
-  // 3. Disable all vpn-nat-* firewall rules
+  // 3. Disable NAT rule for wg-konnect and enable Local Route
   try {
     const natRes = await routerFetch('/rest/ip/firewall/nat', { method: 'GET' }, creds);
     if (natRes.ok) {
       const natList: any[] = await natRes.json();
       for (const nat of natList) {
         const comment = String(nat.comment || '');
-        if (comment.startsWith('vpn-nat-') && !isItemDisabled(nat)) {
+        if ((comment === KONNECT_NAT_COMMENT || comment.startsWith('vpn-nat-')) && !isItemDisabled(nat)) {
           await routerFetch(
             `/rest/ip/firewall/nat/${nat['.id']}`,
             {
@@ -637,48 +876,30 @@ export async function disconnectVpn(): Promise<void> {
             },
             creds,
           );
+        } else if (comment === 'Local Route' && isItemDisabled(nat)) {
+          await routerFetch(
+            `/rest/ip/firewall/nat/${nat['.id']}`,
+            {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ disabled: 'false' }),
+            },
+            creds,
+          );
         }
       }
     }
   } catch (err) {
-    console.warn('[disconnectVpn] NAT disable warning:', err);
+    console.warn('[disconnectVpn] NAT warning:', err);
   }
 
-  // 3b. Enable 'Local Route' NAT rule so traffic falls back to local internet
-  try {
-    const natRes2 = await routerFetch('/rest/ip/firewall/nat', { method: 'GET' }, creds);
-    if (natRes2.ok) {
-      const natList2: any[] = await natRes2.json();
-      const localRoute = natList2.find(
-        (n: any) =>
-          String(n.comment || '') === 'Local Route' &&
-          String(n.chain || '') === 'srcnat',
-      );
-      if (localRoute && isItemDisabled(localRoute)) {
-        await routerFetch(
-          `/rest/ip/firewall/nat/${localRoute['.id']}`,
-          {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ disabled: 'false' }),
-          },
-          creds,
-        );
-        console.log('[disconnectVpn] Enabled Local Route NAT rule');
-      }
-    }
-  } catch (err) {
-    console.warn('[disconnectVpn] Local Route enable warning:', err);
-  }
-
-  // 4. Disable all app-provisioned WireGuard peers
+  // 4. Disable peers
   try {
     const peersRes = await routerFetch('/rest/interface/wireguard/peers', { method: 'GET' }, creds);
     if (peersRes.ok) {
       const peerList: any[] = await peersRes.json();
       for (const p of peerList) {
-        const isAppPeer = String(p.interface || '').startsWith('wg-');
-        if (isAppPeer && !isItemDisabled(p)) {
+        if (String(p.interface || '').startsWith('wg-') && !isItemDisabled(p)) {
           await routerFetch(
             `/rest/interface/wireguard/peers/${p['.id']}`,
             {
@@ -695,14 +916,13 @@ export async function disconnectVpn(): Promise<void> {
     console.warn('[disconnectVpn] Peer disable warning:', err);
   }
 
-  // 5. Disable all app-provisioned WireGuard IP addresses
+  // 5. Disable IP address
   try {
     const addrRes = await routerFetch('/rest/ip/address', { method: 'GET' }, creds);
     if (addrRes.ok) {
       const addrList: any[] = await addrRes.json();
       for (const a of addrList) {
-        const isAppAddr = String(a.interface || '').startsWith('wg-');
-        if (isAppAddr && !isItemDisabled(a)) {
+        if (String(a.interface || '').startsWith('wg-') && !isItemDisabled(a)) {
           await routerFetch(
             `/rest/ip/address/${a['.id']}`,
             {
@@ -718,6 +938,110 @@ export async function disconnectVpn(): Promise<void> {
   } catch (err) {
     console.warn('[disconnectVpn] IP address disable warning:', err);
   }
+
+  console.log('[disconnectVpn] ✅ Successfully disconnected VPN');
+}
+
+/**
+ * Poll the router for current WireGuard connection status.
+ * Evaluates whether konnect-vpn-split1 is enabled and reads peer handshake.
+ * This function NEVER throws.
+ */
+export async function getConnectionStatus(): Promise<ConnectionStatus> {
+  const creds = await getStoredCredentials();
+  if (!creds) {
+    return { kind: 'authError' };
+  }
+
+  // 1. Check if VPN split route is enabled
+  let routes: any[] = [];
+  try {
+    const routesRes = await routerFetch(
+      '/rest/ip/route',
+      { method: 'GET', headers: { Accept: 'application/json' } },
+      creds,
+    );
+    if (routesRes.ok) {
+      routes = await routesRes.json();
+    }
+  } catch (err) {
+    if (err instanceof RouterAuthError) return { kind: 'authError' };
+    return { kind: 'unreachable' };
+  }
+
+  const split1 = Array.isArray(routes)
+    ? routes.find((r) => {
+        const comment = String(r.comment || '');
+        return (
+          (comment === KONNECT_SPLIT1_COMMENT || comment.startsWith('vpn-split1-')) &&
+          !isItemDisabled(r)
+        );
+      })
+    : null;
+
+  if (!split1) {
+    return {
+      kind: 'disconnected',
+      activeServer: null,
+      lastHandshakeSecondsAgo: null,
+    };
+  }
+
+  // 2. Determine active server
+  const allCountries = await getAllCountries();
+  const allServers: ServerEntry[] = [];
+  for (const c of allCountries) {
+    allServers.push(...c.servers);
+  }
+
+  let activeServerId: string | null = null;
+  const comment = String(split1.comment || '');
+  if (comment.startsWith('vpn-split1-')) {
+    activeServerId = comment.replace('vpn-split1-', '');
+  }
+
+  // 3. Query peer on wg-konnect to get handshake
+  let peers: MikroTikPeer[] = [];
+  try {
+    const peersRes = await routerFetch(
+      '/rest/interface/wireguard/peers',
+      { method: 'GET', headers: { Accept: 'application/json' } },
+      creds,
+    );
+    if (peersRes.ok) {
+      peers = await peersRes.json();
+    }
+  } catch (err) {
+    if (err instanceof RouterAuthError) return { kind: 'authError' };
+    return { kind: 'unreachable' };
+  }
+
+  const peer = Array.isArray(peers)
+    ? peers.find((p) => p.interface === KONNECT_WG_INTERFACE || !isItemDisabled(p))
+    : undefined;
+
+  if (!activeServerId && peer && typeof peer.comment === 'string' && peer.comment.trim() !== '') {
+    activeServerId = peer.comment.trim();
+  }
+  if (!activeServerId) {
+    activeServerId = await getLastConnectedServerId();
+  }
+
+  const activeServer: ServerEntry =
+    allServers.find((s) => s.id === activeServerId) || {
+      id: activeServerId || 'konnect-vpn',
+      label: activeServerId || 'VPN Server',
+      interfaceName: KONNECT_WG_INTERFACE,
+      endpointIp: typeof peer?.['endpoint-address'] === 'string' ? peer['endpoint-address'] : '127.0.0.1',
+    };
+
+  const handshakeAgo = peer ? parseMikroTikDuration(peer['last-handshake']) : null;
+
+  return {
+    kind: 'connected',
+    activeServer,
+    lastHandshakeSecondsAgo: handshakeAgo,
+  };
 }
 
 /**
@@ -739,7 +1063,7 @@ export async function pingServer(endpointIp: string): Promise<number | null> {
         },
         body: JSON.stringify({
           address: endpointIp,
-          count: String(LATENCY_PING_COUNT),
+          count: '1',
         }),
       },
       creds,
@@ -750,13 +1074,11 @@ export async function pingServer(endpointIp: string): Promise<number | null> {
     const data = await response.json();
     if (!Array.isArray(data) || data.length === 0) return null;
 
-    // The final summary item in RouterOS ping response typically contains avg-rtt / avg / rtt
     for (let i = data.length - 1; i >= 0; i--) {
       const item = data[i];
       const avg = item['avg-rtt'] || item['avg'] || item['rtt'] || item['time'];
       if (avg) {
-        // Parse "24ms" or "24.5ms" or raw number
-        const match = String(avg).match(/([\d.]+)\s*ms?/);
+        const match = String(avg).match(/^([\d.]+)\s*ms/i) || String(avg).match(/([\d.]+)\s*ms/i);
         if (match) {
           return Math.round(parseFloat(match[1]));
         }
@@ -774,7 +1096,7 @@ export async function pingServer(endpointIp: string): Promise<number | null> {
 
 /**
  * Rank servers for a given country by live latency.
- * Calls pingServer() for each in parallel, sorts ascending (nulls last).
+ * Deduplicates by endpoint IP to avoid RouterOS ping serialization delays.
  */
 export async function rankServers(
   countryCode: CountryCode | string,
@@ -793,12 +1115,20 @@ export async function rankServers(
     return [];
   }
 
-  const results = await Promise.all(
-    servers.map(async (server) => {
-      const latencyMs = await pingServer(server.endpointIp);
-      return { server, latencyMs };
-    }),
-  );
+  // Deduplicate pings by endpointIp so we don't bombard the router with concurrent ping requests
+  const uniqueIps = Array.from(new Set(servers.map((s) => s.endpointIp)));
+  const ipLatencyMap = new Map<string, number | null>();
+
+  // Ping unique IPs sequentially with count: 1 to ensure instant response
+  for (const ip of uniqueIps) {
+    const latency = await pingServer(ip);
+    ipLatencyMap.set(ip, latency);
+  }
+
+  const results: RankedServer[] = servers.map((server) => ({
+    server,
+    latencyMs: ipLatencyMap.get(server.endpointIp) ?? null,
+  }));
 
   // Sort ascending by latency, nulls last
   results.sort((a, b) => {
@@ -812,110 +1142,7 @@ export async function rankServers(
 }
 
 /**
- * Poll the router for current WireGuard connection status.
- * Matches interface name across all countries/servers from getAllCountries().
- * This function NEVER throws.
- */
-/**
- * Poll the router for current WireGuard connection status.
- * Evaluates active routing rules and checks live handshake freshness.
- * This function NEVER throws.
- */
-export async function getConnectionStatus(): Promise<ConnectionStatus> {
-  const creds = await getStoredCredentials();
-  if (!creds) {
-    return { kind: 'authError' };
-  }
-
-  // 1. Check active routes to see if any VPN route is enabled
-  let routes: any[] = [];
-  try {
-    const routesRes = await routerFetch(
-      '/rest/ip/route',
-      { method: 'GET', headers: { Accept: 'application/json' } },
-      creds,
-    );
-    if (routesRes.ok) {
-      routes = await routesRes.json();
-    }
-  } catch (err) {
-    if (err instanceof RouterAuthError) return { kind: 'authError' };
-    return { kind: 'unreachable' };
-  }
-
-  // Find enabled vpn-split1 route
-  let activeServerId: string | null = null;
-  if (Array.isArray(routes)) {
-    for (const r of routes) {
-      const comment = String(r.comment || '');
-      if (comment.startsWith('vpn-split1-') && !isItemDisabled(r)) {
-        activeServerId = comment.replace('vpn-split1-', '');
-        break;
-      }
-    }
-  }
-
-  // If no VPN route is active, we are in direct internet mode (disconnected)
-  if (!activeServerId) {
-    return {
-      kind: 'disconnected',
-      activeServer: null,
-      lastHandshakeSecondsAgo: null,
-    };
-  }
-
-  // 2. Fetch peers to check handshake on the active server's interface
-  let peers: MikroTikPeer[] = [];
-  try {
-    const peersRes = await routerFetch(
-      '/rest/interface/wireguard/peers',
-      { method: 'GET', headers: { Accept: 'application/json' } },
-      creds,
-    );
-    if (peersRes.ok) {
-      peers = await peersRes.json();
-    }
-  } catch (err) {
-    if (err instanceof RouterAuthError) return { kind: 'authError' };
-    return { kind: 'unreachable' };
-  }
-
-  const allCountries = await getAllCountries();
-  const allServers: ServerEntry[] = [];
-  for (const c of allCountries) {
-    allServers.push(...c.servers);
-  }
-
-  const activeServer = allServers.find((s) => s.id === activeServerId) || {
-    id: activeServerId,
-    label: activeServerId,
-    interfaceName: `wg-${activeServerId}`,
-    endpointIp: '127.0.0.1',
-  };
-
-  const peer = Array.isArray(peers)
-    ? peers.find((p) => p.interface === activeServer.interfaceName && !isItemDisabled(p))
-    : undefined;
-  const handshakeAgo = peer ? parseMikroTikDuration(peer['last-handshake']) : null;
-
-  if (handshakeAgo !== null && handshakeAgo <= HANDSHAKE_STALE_THRESHOLD_SECONDS) {
-    return {
-      kind: 'connected',
-      activeServer,
-      lastHandshakeSecondsAgo: handshakeAgo,
-    };
-  }
-
-  return {
-    kind: 'disconnected',
-    activeServer,
-    lastHandshakeSecondsAgo: handshakeAgo,
-  };
-}
-
-/**
- * Provisions a new WireGuard server onto the router natively via REST API.
- * Crucial: The private key is only used in this function and never saved to device storage!
+ * Provisions a new WireGuard server into local app state and ensures router baseline objects exist.
  */
 export async function provisionServer(params: {
   parsedConfig: ParsedWireGuardConfig;
@@ -930,303 +1157,50 @@ export async function provisionServer(params: {
     throw new RouterAuthError();
   }
 
-  const { network, gateway } = computeNetworkAndGateway(
-    params.parsedConfig.address,
-    params.parsedConfig.dns,
-  );
-  const listenPort = await getNextListenPort();
-  const interfaceName = `wg-${params.serverId}`;
-
-  console.log(`[provisionServer] Provisioning ${params.serverId} (${interfaceName}) via REST API...`);
-
-  // 1. Ensure WireGuard Interface exists
-  const existingIfRes = await routerFetch(
-    `/rest/interface/wireguard?name=${encodeURIComponent(interfaceName)}`,
-    { method: 'GET' },
-    creds,
-  );
-  const existingIfList: any[] = existingIfRes.ok ? await existingIfRes.json() : [];
-
-  if (existingIfList.length > 0) {
-    const id = existingIfList[0]['.id'];
-    const currentPort = existingIfList[0]['listen-port'] || String(listenPort);
-    console.log(`[provisionServer] Updating interface ${interfaceName} (${id})...`);
-    await routerFetch(
-      `/rest/interface/wireguard/${id}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          'listen-port': currentPort,
-          'private-key': params.parsedConfig.privateKey,
-          comment: params.serverId,
-        }),
-      },
-      creds,
-    );
-  } else {
-    console.log(`[provisionServer] Creating interface ${interfaceName}...`);
-    const createIfRes = await routerFetch(
-      '/rest/interface/wireguard',
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: interfaceName,
-          'listen-port': String(listenPort),
-          'private-key': params.parsedConfig.privateKey,
-          comment: params.serverId,
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-    if (!createIfRes.ok) {
-      const txt = await createIfRes.text().catch(() => '');
-      throw new RouterScriptError(`Failed to create interface: HTTP ${createIfRes.status} ${txt}`);
-    }
-  }
-
-  // 2. Ensure WireGuard Peer exists
-  const existingPeerRes = await routerFetch(
-    `/rest/interface/wireguard/peers?interface=${encodeURIComponent(interfaceName)}`,
-    { method: 'GET' },
-    creds,
-  );
-  const existingPeerList: any[] = existingPeerRes.ok ? await existingPeerRes.json() : [];
-
-  if (existingPeerList.length > 0) {
-    const id = existingPeerList[0]['.id'];
-    console.log(`[provisionServer] Updating peer for ${interfaceName} (${id})...`);
-    await routerFetch(
-      `/rest/interface/wireguard/peers/${id}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          'public-key': params.parsedConfig.publicKey,
-          'endpoint-address': params.parsedConfig.endpointAddress,
-          'endpoint-port': String(params.parsedConfig.endpointPort),
-          'allowed-address': '0.0.0.0/0',
-          'persistent-keepalive': '25s',
-          comment: params.serverId,
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-  } else {
-    console.log(`[provisionServer] Creating peer for ${interfaceName}...`);
-    const createPeerRes = await routerFetch(
-      '/rest/interface/wireguard/peers',
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          interface: interfaceName,
-          'public-key': params.parsedConfig.publicKey,
-          'endpoint-address': params.parsedConfig.endpointAddress,
-          'endpoint-port': String(params.parsedConfig.endpointPort),
-          'allowed-address': '0.0.0.0/0',
-          'persistent-keepalive': '25s',
-          comment: params.serverId,
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-    if (!createPeerRes.ok) {
-      const txt = await createPeerRes.text().catch(() => '');
-      throw new RouterScriptError(`Failed to create peer: HTTP ${createPeerRes.status} ${txt}`);
-    }
-  }
-
-  // 3. Ensure IP Address exists and clean up conflicting/orphan addresses
+  // Store raw/parsed config in AsyncStorage so switchServer can access it anytime
   try {
-    const allAddrsRes = await routerFetch('/rest/ip/address', { method: 'GET' }, creds);
-    if (allAddrsRes.ok) {
-      const allAddrs: any[] = await allAddrsRes.json();
-      for (const a of allAddrs) {
-        const iface = String(a.interface || '');
-        const isOrphan =
-          iface.startsWith('*') ||
-          (a.comment === params.serverId && iface !== interfaceName);
-        if (isOrphan) {
-          console.log(`[provisionServer] Removing orphan IP address ${a['.id']} (${a.address} on ${iface})...`);
-          await routerFetch(`/rest/ip/address/${a['.id']}`, { method: 'DELETE' }, creds);
-        }
-      }
-    }
+    const raw = await AsyncStorage.getItem(IMPORTED_CONFIGS_KEY);
+    const map: Record<string, string> = raw ? JSON.parse(raw) : {};
+    map[params.serverId] = `[Interface]\nPrivateKey = ${params.parsedConfig.privateKey}\nAddress = ${params.parsedConfig.address}\nDNS = ${params.parsedConfig.dns}\n\n[Peer]\nPublicKey = ${params.parsedConfig.publicKey}\nEndpoint = ${params.parsedConfig.endpointAddress}:${params.parsedConfig.endpointPort}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n`;
+    await AsyncStorage.setItem(IMPORTED_CONFIGS_KEY, JSON.stringify(map));
   } catch (err) {
-    console.warn('[provisionServer] Orphan IP cleanup warning:', err);
+    console.warn('[provisionServer] Storage warning:', err);
   }
 
-  const existingAddrRes = await routerFetch(
-    `/rest/ip/address?interface=${encodeURIComponent(interfaceName)}`,
-    { method: 'GET' },
-    creds,
-  );
-  const existingAddrList: any[] = existingAddrRes.ok ? await existingAddrRes.json() : [];
-
-  if (existingAddrList.length > 0) {
-    const id = existingAddrList[0]['.id'];
-    console.log(`[provisionServer] Updating IP address for ${interfaceName} (${id})...`);
-    await routerFetch(
-      `/rest/ip/address/${id}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          address: params.parsedConfig.address,
-          network: network,
-          comment: params.serverId,
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-  } else {
-    console.log(`[provisionServer] Creating IP address for ${interfaceName}...`);
-    const createAddrRes = await routerFetch(
-      '/rest/ip/address',
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          interface: interfaceName,
-          address: params.parsedConfig.address,
-          network: network,
-          comment: params.serverId,
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-    if (!createAddrRes.ok) {
-      const txt = await createAddrRes.text().catch(() => '');
-      throw new RouterScriptError(`Failed to create IP address: HTTP ${createAddrRes.status} ${txt}`);
-    }
-  }
-
-  // 4. Ensure Firewall NAT Masquerade rule exists
-  const existingNatRes = await routerFetch(
-    `/rest/ip/firewall/nat?out-interface=${encodeURIComponent(interfaceName)}`,
-    { method: 'GET' },
-    creds,
-  );
-  const existingNatList: any[] = existingNatRes.ok ? await existingNatRes.json() : [];
-
-  if (existingNatList.length === 0) {
-    console.log(`[provisionServer] Creating NAT masquerade for ${interfaceName}...`);
-    await routerFetch(
-      '/rest/ip/firewall/nat',
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chain: 'srcnat',
-          action: 'masquerade',
-          'out-interface': interfaceName,
-          comment: `vpn-nat-${params.serverId}`,
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-  } else {
-    const id = existingNatList[0]['.id'];
-    await routerFetch(
-      `/rest/ip/firewall/nat/${id}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          disabled: 'true',
-        }),
-      },
-      creds,
-    );
-  }
-
-  // 5. Ensure Split Policy Routes exist
-  // Find LAN physical gateway
-  let lanGateway = '172.20.0.1';
+  // Ensure single wg-konnect base interface exists on router (disabled)
   try {
-    const defaultRouteRes = await routerFetch(
-      '/rest/ip/route?dst-address=0.0.0.0/0',
-      { method: 'GET' },
-      creds,
-    );
-    if (defaultRouteRes.ok) {
-      const defaultRoutes: any[] = await defaultRouteRes.json();
-      if (defaultRoutes.length > 0 && defaultRoutes[0].gateway) {
-        lanGateway = defaultRoutes[0].gateway;
+    const ifacesRes = await routerFetch('/rest/interface/wireguard', { method: 'GET' }, creds);
+    if (ifacesRes.ok) {
+      const ifaces: any[] = await ifacesRes.json();
+      const exists = ifaces.some((i) => i.name === KONNECT_WG_INTERFACE);
+      if (!exists) {
+        await routerFetch(
+          '/rest/interface/wireguard',
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: KONNECT_WG_INTERFACE,
+              'listen-port': KONNECT_PORT,
+              mtu: KONNECT_MTU,
+              'private-key': params.parsedConfig.privateKey,
+              comment: 'konnect-vpn-interface',
+              disabled: 'true',
+            }),
+          },
+          creds,
+        );
       }
     }
   } catch {
-    // Keep fallback 172.20.0.1
+    // Non-fatal
   }
 
-  const routesToConfigure = [
-    {
-      comment: `vpn-split1-${params.serverId}`,
-      'dst-address': '0.0.0.0/1',
-      gateway: interfaceName,
-      disabled: 'true',
-    },
-    {
-      comment: `vpn-split2-${params.serverId}`,
-      'dst-address': '128.0.0.0/1',
-      gateway: interfaceName,
-      disabled: 'true',
-    },
-    {
-      comment: `vpn-endpoint-${params.serverId}`,
-      'dst-address': `${params.parsedConfig.endpointAddress}/32`,
-      gateway: lanGateway,
-      disabled: 'true',
-    },
-  ];
-
-  for (const rConfig of routesToConfigure) {
-    const existingRouteRes = await routerFetch(
-      `/rest/ip/route?comment=${encodeURIComponent(rConfig.comment)}`,
-      { method: 'GET' },
-      creds,
-    );
-    const existingRouteList: any[] = existingRouteRes.ok ? await existingRouteRes.json() : [];
-
-    if (existingRouteList.length > 0) {
-      const id = existingRouteList[0]['.id'];
-      await routerFetch(
-        `/rest/ip/route/${id}`,
-        {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(rConfig),
-        },
-        creds,
-      );
-    } else {
-      await routerFetch(
-        '/rest/ip/route',
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(rConfig),
-        },
-        creds,
-      );
-    }
-  }
-
-  console.log(`[provisionServer] ✅ Successfully provisioned ${params.serverId} via REST API!`);
-
-  // On success, save non-sensitive server descriptor to local storage
+  // Save server descriptor to local storage for picker UI
   const newServerEntry: ServerEntry = {
     id: params.serverId,
     label: params.label,
-    interfaceName: interfaceName,
+    interfaceName: KONNECT_WG_INTERFACE,
     endpointIp: params.parsedConfig.endpointAddress,
   };
 
@@ -1237,3 +1211,4 @@ export async function provisionServer(params: {
     newServerEntry,
   );
 }
+

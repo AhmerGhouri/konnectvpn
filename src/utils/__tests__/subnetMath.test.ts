@@ -25,13 +25,13 @@ describe('computeNetworkAndGateway', () => {
 
   it('computes network and gateway for 10.2.0.2/32', () => {
     const res = computeNetworkAndGateway('10.2.0.2/32');
-    expect(res.network).toBe('10.2.0.2');
+    expect(res.network).toBe('10.2.0.1');
     expect(res.gateway).toBe('10.2.0.1');
   });
 
   it('uses dnsFallback if provided for /32', () => {
     const res = computeNetworkAndGateway('10.2.0.2/32', '10.2.0.254');
-    expect(res.network).toBe('10.2.0.2');
+    expect(res.network).toBe('10.2.0.254');
     expect(res.gateway).toBe('10.2.0.254');
   });
 

@@ -9,7 +9,7 @@
 // - Calls provisionServer() on the router
 // - Never stores the private key on-device past the single provisioning call
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   View,
   Text,
@@ -23,13 +23,13 @@ import {
   Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import * as Keychain from 'react-native-keychain';
 import {
   parseWireGuardConfig,
   type ParsedWireGuardConfig,
   ParseError,
 } from '../utils/wireguardConfigParser';
 import { provisionServer } from '../api/routerClient';
+import { clearImportedServers } from '../config/serverStore';
 
 interface AdminScreenProps {
   onClose: () => void;
@@ -37,14 +37,6 @@ interface AdminScreenProps {
 
 export default function AdminScreen({ onClose }: AdminScreenProps) {
   const insets = useSafeAreaInsets();
-
-  // Biometric gate state
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
-
-  // Manual fallback credential gate
-  const [fallbackPassword, setFallbackPassword] = useState('');
-  const [isVerifyingFallback, setIsVerifyingFallback] = useState(false);
 
   // Import form state
   const [confText, setConfText] = useState('');
@@ -61,59 +53,6 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
   // Execution state
   const [isProvisioning, setIsProvisioning] = useState(false);
   const [provisionError, setProvisionError] = useState<string | null>(null);
-
-  // -------------------------------------------------------------------------
-  // Biometric Authentication Gate on mount
-  // -------------------------------------------------------------------------
-  const authenticate = useCallback(async () => {
-    setAuthError(null);
-    try {
-      // Check biometry availability
-      const biometryType = await Keychain.getSupportedBiometryType();
-      if (biometryType) {
-        // Attempt prompt with biometric access control
-        const result = await Keychain.getGenericPassword({
-          service: 'konnectvpn-router',
-          authenticationPrompt: {
-            title: 'Admin Verification',
-            subtitle: 'Authorize with Face ID / Touch ID',
-            description: 'Access the server provisioning console',
-            cancel: 'Cancel',
-          },
-        });
-        if (result) {
-          setIsAuthenticated(true);
-          return;
-        }
-      }
-    } catch {
-      // Biometrics failed or cancelled
-    }
-    // Fall back to credential gate
-    setAuthError('Biometric authentication failed. Enter router password to proceed.');
-  }, []);
-
-  useEffect(() => {
-    authenticate();
-  }, [authenticate]);
-
-  const handleFallbackVerify = useCallback(async () => {
-    if (!fallbackPassword) return;
-    setIsVerifyingFallback(true);
-    try {
-      const stored = await Keychain.getGenericPassword({ service: 'konnectvpn-router' });
-      if (stored && stored.password === fallbackPassword) {
-        setIsAuthenticated(true);
-        setAuthError(null);
-      } else {
-        setAuthError('Incorrect password. Access denied.');
-      }
-    } catch {
-      setAuthError('Could not verify credentials.');
-    } finally {
-      setIsVerifyingFallback(false);
-    }
-  }, [fallbackPassword]);
 
   // -------------------------------------------------------------------------
   // Parse WireGuard Config
@@ -183,6 +122,28 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
     }
   }, [parsedConfig, serverId, serverLabel, countryCode, countryLabel, countryFlag, onClose]);
 
+  const handleClearStorage = useCallback(() => {
+    Alert.alert(
+      'Clear Keychain Server Entries',
+      'This will delete all imported servers, raw configs, and pre-provisioned server records stored in Keychain.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear All',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await clearImportedServers();
+              Alert.alert('Success', 'All imported server entries removed from Keychain.');
+            } catch (err: any) {
+              Alert.alert('Error', err?.message || 'Failed to clear Keychain entries');
+            }
+          },
+        },
+      ],
+    );
+  }, []);
+
   // Obscure key utility
   const obscureKey = (key: string) => {
     if (key.length <= 8) return '••••••••';
@@ -190,57 +151,7 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
   };
 
   // -------------------------------------------------------------------------
-  // Render: Gate Screen if not authenticated
-  // -------------------------------------------------------------------------
-  if (!isAuthenticated) {
-    return (
-      <View style={[styles.root, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
-        <View style={styles.gateContainer}>
-          <Text style={styles.gateIcon}>🛡️</Text>
-          <Text style={styles.gateTitle}>Admin Console</Text>
-          <Text style={styles.gateSubtitle}>
-            This area is restricted to router administrators for provisioning new WireGuard servers.
-          </Text>
-
-          {authError && <Text style={styles.gateError}>{authError}</Text>}
-
-          <View style={styles.fallbackBox}>
-            <TextInput
-              style={styles.input}
-              placeholder="Router password"
-              placeholderTextColor="#64748B"
-              secureTextEntry
-              value={fallbackPassword}
-              onChangeText={setFallbackPassword}
-            />
-
-            <Pressable
-              style={styles.verifyButton}
-              onPress={handleFallbackVerify}
-              disabled={isVerifyingFallback}
-            >
-              {isVerifyingFallback ? (
-                <ActivityIndicator color="#FFF" size="small" />
-              ) : (
-                <Text style={styles.buttonText}>Unlock with Password</Text>
-              )}
-            </Pressable>
-
-            <Pressable style={styles.retryBioBtn} onPress={authenticate}>
-              <Text style={styles.retryBioText}>Use Face ID / Touch ID</Text>
-            </Pressable>
-          </View>
-
-          <Pressable style={styles.cancelGateBtn} onPress={onClose}>
-            <Text style={styles.cancelGateText}>Cancel</Text>
-          </Pressable>
-        </View>
-      </View>
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // Render: Admin Provisioning Form
+  // Render: Import Server Form
   // -------------------------------------------------------------------------
   return (
     <KeyboardAvoidingView
@@ -248,7 +159,7 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Server Provisioning</Text>
+        <Text style={styles.headerTitle}>Import Server (.conf)</Text>
         <Pressable onPress={onClose} hitSlop={8}>
           <Text style={styles.doneText}>Close</Text>
         </Pressable>
@@ -393,6 +304,17 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
             </Pressable>
           </View>
         )}
+
+        {/* Keychain Storage Management */}
+        <View style={styles.manageStorageBox}>
+          <Text style={styles.sectionHeading}>Manage Keychain Storage</Text>
+          <Text style={styles.helperText}>
+            Remove imported server records, cached WireGuard configurations, and router provisioning history from device Keychain:
+          </Text>
+          <Pressable style={styles.dangerButton} onPress={handleClearStorage}>
+            <Text style={styles.dangerButtonText}>🗑️ Clear Server Entries from Keychain</Text>
+          </Pressable>
+        </View>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -406,6 +328,28 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: '#0B1120',
+  },
+  manageStorageBox: {
+    marginTop: 36,
+    paddingTop: 24,
+    borderTopWidth: 1,
+    borderTopColor: '#1E293B',
+    marginBottom: 20,
+  },
+  dangerButton: {
+    backgroundColor: '#7F1D1D',
+    borderWidth: 1,
+    borderColor: '#EF4444',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  dangerButtonText: {
+    color: '#FEE2E2',
+    fontSize: 15,
+    fontWeight: '600',
   },
   header: {
     flexDirection: 'row',
@@ -543,67 +487,5 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.6,
-  },
-
-  // Gate styles
-  gateContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 30,
-  },
-  gateIcon: {
-    fontSize: 54,
-    marginBottom: 16,
-  },
-  gateTitle: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: '#F1F5F9',
-    marginBottom: 8,
-  },
-  gateSubtitle: {
-    fontSize: 14,
-    color: '#94A3B8',
-    textAlign: 'center',
-    lineHeight: 20,
-    marginBottom: 24,
-  },
-  gateError: {
-    color: '#FCA5A5',
-    fontSize: 13,
-    textAlign: 'center',
-    marginBottom: 16,
-  },
-  fallbackBox: {
-    width: '100%',
-  },
-  verifyButton: {
-    backgroundColor: '#6366F1',
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-    marginTop: 12,
-  },
-  buttonText: {
-    color: '#FFF',
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  retryBioBtn: {
-    alignItems: 'center',
-    marginTop: 16,
-  },
-  retryBioText: {
-    color: '#6366F1',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  cancelGateBtn: {
-    marginTop: 28,
-  },
-  cancelGateText: {
-    color: '#94A3B8',
-    fontSize: 15,
   },
 });

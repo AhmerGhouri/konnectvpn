@@ -39,12 +39,13 @@ export function computeNetworkAndGateway(
     throw new Error(`Invalid prefix length in CIDR: "${cidrAddress}"`);
   }
 
-  // For /32 point-to-point host routes, the network address is the IP itself,
-  // and the gateway is the remote peer / DNS (typically 10.2.0.1 in Proton VPN).
+  // For /32 point-to-point host routes, the network address in RouterOS is the remote peer / gateway
+  // (typically 10.2.0.1 in Proton VPN) so RouterOS creates an on-link connected route to the peer.
   if (prefix === 32) {
+    const gw = dnsFallback || '10.2.0.1';
     return {
-      network: ipPart,
-      gateway: dnsFallback || '10.2.0.1',
+      network: gw,
+      gateway: gw,
     };
   }
 
