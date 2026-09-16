@@ -38,6 +38,7 @@ import {
 import {
   getAllCountries,
   clearImportedServers,
+  removeImportedServer,
   type CountryWithServers,
 } from '../config/serverStore';
 import {
@@ -281,6 +282,28 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
     },
     [pollStatus],
   );
+
+  const handleDeleteServer = useCallback((server: ServerEntry) => {
+    Alert.alert('Delete server?', `Remove ${server.label} from this device? This does not disconnect or remove it from the router.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await removeImportedServer(server.id);
+            const updated = await getAllCountries();
+            setCountriesList(updated);
+            setRankingCache({});
+            setRankedServers([]);
+            setSelectedCountry(null);
+          } catch (err: any) {
+            Alert.alert('Error', err?.message || 'Failed to delete server');
+          }
+        },
+      },
+    ]);
+  }, []);
 
   // -------------------------------------------------------------------------
   // Sign Out Handler (Purely local, NEVER calls disconnectVpn)
@@ -565,6 +588,19 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
                           {c.servers.length} servers
                         </Text>
                       )}
+                      {c.servers.length === 1 && (
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={`Delete ${c.servers[0].label}`}
+                          hitSlop={8}
+                          onPress={(event) => {
+                            event.stopPropagation();
+                            handleDeleteServer(c.servers[0]);
+                          }}
+                        >
+                          <Text style={styles.deleteServerText}>Delete</Text>
+                        </Pressable>
+                      )}
                       <Text style={styles.chevron}>›</Text>
                     </View>
                   </Pressable>
@@ -617,6 +653,18 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
                         </View>
 
                         <View style={styles.itemRight}>
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={`Delete ${item.server.label}`}
+                            disabled={isRankingLoading}
+                            hitSlop={8}
+                            onPress={(event) => {
+                              event.stopPropagation();
+                              handleDeleteServer(item.server);
+                            }}
+                          >
+                            <Text style={styles.deleteServerText}>Delete</Text>
+                          </Pressable>
                           {isRankingLoading && item.latencyMs === null ? (
                             <ActivityIndicator size="small" color="#6366F1" />
                           ) : (
@@ -1035,6 +1083,12 @@ const styles = StyleSheet.create({
     marginTop: 12,
     fontSize: 14,
     color: COLORS.textSecondary,
+  },
+  deleteServerText: {
+    color: '#EF4444',
+    fontSize: 14,
+    fontWeight: '600',
+    padding: 8,
   },
   serverItem: {
     flexDirection: 'row',

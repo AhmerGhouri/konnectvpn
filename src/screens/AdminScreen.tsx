@@ -22,6 +22,7 @@ import {
   Platform,
   Alert,
 } from 'react-native';
+import * as Keychain from 'react-native-keychain';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   parseWireGuardConfig,
@@ -37,6 +38,44 @@ interface AdminScreenProps {
 
 export default function AdminScreen({ onClose }: AdminScreenProps) {
   const insets = useSafeAreaInsets();
+
+  const [keychainData, setKeychainData] = useState<string | null>(null);
+  const [isReadingKeychain, setIsReadingKeychain] = useState(false);
+  const [showConfigurationKeys, setShowConfigurationKeys] = useState(false);
+
+  const handleViewKeychain = useCallback(async () => {
+    setIsReadingKeychain(true);
+    setKeychainData(null);
+    setShowConfigurationKeys(false);
+    try {
+      const entries = await Promise.all([
+        'konnectvpn_imported_servers',
+        'konnectvpn_imported_configs',
+        'konnectvpn_preprovisioned_servers',
+        'konnectvpn_last_connected_server',
+        'konnectvpn_deleted_servers',
+      ].map(async (key) => {
+        const result = await Keychain.getGenericPassword({ service: `kv-${key}` });
+        if (!result) return `${key}\nNo stored data`;
+        let value = result.password;
+        try {
+          const parsed = JSON.parse(value);
+          // Show each saved .conf with its original line breaks.
+          value = key === 'konnectvpn_imported_configs'
+            ? Object.entries(parsed).map(([id, config]) => `${id}\n${config}`).join('\n\n') || 'No stored configurations'
+            : JSON.stringify(parsed, null, 2);
+        } catch {
+          // Some entries, such as the last connected server ID, are plain text.
+        }
+        return `${key}\n${value}`;
+      }));
+      setKeychainData(entries.join('\n\n────────────────────\n\n'));
+    } catch (err: any) {
+      Alert.alert('Keychain Error', err?.message || 'Unable to read saved server data.');
+    } finally {
+      setIsReadingKeychain(false);
+    }
+  }, []);
 
   // Import form state
   const [confText, setConfText] = useState('');
@@ -134,6 +173,8 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
           onPress: async () => {
             try {
               await clearImportedServers();
+              setKeychainData(null);
+              setShowConfigurationKeys(false);
               Alert.alert('Success', 'All imported server entries removed from Keychain.');
             } catch (err: any) {
               Alert.alert('Error', err?.message || 'Failed to clear Keychain entries');
@@ -309,8 +350,47 @@ export default function AdminScreen({ onClose }: AdminScreenProps) {
         <View style={styles.manageStorageBox}>
           <Text style={styles.sectionHeading}>Manage Keychain Storage</Text>
           <Text style={styles.helperText}>
-            Remove imported server records, cached WireGuard configurations, and router provisioning history from device Keychain:
+            View or remove imported servers, saved configurations, and connection records on this device. Servers bundled in vpn_countries are not stored here unless imported through the app.
           </Text>
+          <Pressable
+            style={styles.parseButton}
+            onPress={handleViewKeychain}
+            disabled={isReadingKeychain}
+            accessibilityRole="button"
+          >
+            {isReadingKeychain ? <ActivityIndicator color="#FFF" /> : (
+              <Text style={styles.parseButtonText}>View Keychain Server Data</Text>
+            )}
+          </Pressable>
+          {keychainData !== null && (
+            <View>
+              <Pressable
+                style={styles.parseButton}
+                onPress={() => setShowConfigurationKeys((visible) => !visible)}
+                accessibilityRole="button"
+              >
+                <Text style={styles.parseButtonText}>
+                  {showConfigurationKeys ? 'Hide Configuration Keys' : 'Reveal Configuration Keys'}
+                </Text>
+              </Pressable>
+              <Text selectable style={styles.keychainDataText}>
+                {showConfigurationKeys ? keychainData : keychainData.replace(
+                  /((?:PrivateKey|PresharedKey)\s*=\s*)[^\r\n]+/gi,
+                  '$1[hidden]',
+                )}
+              </Text>
+              <Pressable
+                style={styles.parseButton}
+                onPress={() => {
+                  setKeychainData(null);
+                  setShowConfigurationKeys(false);
+                }}
+                accessibilityRole="button"
+              >
+                <Text style={styles.parseButtonText}>Close Server Data</Text>
+              </Pressable>
+            </View>
+          )}
           <Pressable style={styles.dangerButton} onPress={handleClearStorage}>
             <Text style={styles.dangerButtonText}>🗑️ Clear Server Entries from Keychain</Text>
           </Pressable>
@@ -328,6 +408,14 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: '#0B1120',
+  },
+  keychainDataText: {
+    color: '#CBD5E1',
+    backgroundColor: '#0F172A',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 12,
+    padding: 12,
+    marginVertical: 12,
   },
   manageStorageBox: {
     marginTop: 36,

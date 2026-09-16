@@ -8,6 +8,7 @@ import { AsyncStorage } from '../utils/storage';
 import { getBundledCountriesList } from '../vpn_countries';
 
 const IMPORTED_SERVERS_KEY = 'konnectvpn_imported_servers';
+const DELETED_SERVERS_KEY = 'konnectvpn_deleted_servers';
 
 export type CountryWithServers = {
   code: string;
@@ -67,7 +68,14 @@ export async function getAllCountries(): Promise<CountryWithServers[]> {
     console.error('[serverStore] Failed to load imported servers:', err);
   }
 
-  return merged;
+  const deletedRaw = await AsyncStorage.getItem(DELETED_SERVERS_KEY);
+  const deletedIds: string[] = deletedRaw ? JSON.parse(deletedRaw) : [];
+  return merged
+    .map((country) => ({
+      ...country,
+      servers: country.servers.filter((server) => !deletedIds.includes(server.id)),
+    }))
+    .filter((country) => country.servers.length > 0);
 }
 
 /**
@@ -94,6 +102,12 @@ export async function appendImportedServer(
     });
 
     await AsyncStorage.setItem(IMPORTED_SERVERS_KEY, JSON.stringify(filtered));
+    const deletedRaw = await AsyncStorage.getItem(DELETED_SERVERS_KEY);
+    const deletedIds: string[] = deletedRaw ? JSON.parse(deletedRaw) : [];
+    await AsyncStorage.setItem(
+      DELETED_SERVERS_KEY,
+      JSON.stringify(deletedIds.filter((id) => id !== server.id)),
+    );
   } catch (err) {
     console.error('[serverStore] Failed to append imported server:', err);
     throw err;
@@ -101,10 +115,15 @@ export async function appendImportedServer(
 }
 
 /**
- * Removes a specific imported server entry from storage / Keychain.
+ * Removes a server locally, including hiding bundled entries on this device.
  */
 export async function removeImportedServer(serverId: string): Promise<void> {
   try {
+    const deletedRaw = await AsyncStorage.getItem(DELETED_SERVERS_KEY);
+    const deletedIds: string[] = deletedRaw ? JSON.parse(deletedRaw) : [];
+    if (!deletedIds.includes(serverId)) {
+      await AsyncStorage.setItem(DELETED_SERVERS_KEY, JSON.stringify([...deletedIds, serverId]));
+    }
     const raw = await AsyncStorage.getItem(IMPORTED_SERVERS_KEY);
     if (raw) {
       const records: ImportedRecord[] = JSON.parse(raw);
