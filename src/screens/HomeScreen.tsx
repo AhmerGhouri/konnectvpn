@@ -25,6 +25,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   getConnectionStatus,
+  checkRouterInternet,
   switchServer,
   disconnectVpn,
   rankServers,
@@ -63,6 +64,40 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
   const [status, setStatus] = useState<ConnectionStatus | null>(null);
   const [isActionInFlight, setIsActionInFlight] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  const [internetStatus, setInternetStatus] = useState<'checking' | 'available' | 'unavailable' | 'unknown'>('checking');
+
+  // Check from MikroTik without overlapping requests or retaining results from an old switch.
+  useEffect(() => {
+    let active = true;
+    let generation = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = async (currentGeneration: number) => {
+      let result: boolean | null = null;
+      try {
+        result = await checkRouterInternet();
+      } catch {
+        // Includes errors reading router credentials.
+      }
+      if (!active || currentGeneration !== generation) return;
+      setInternetStatus(result === true ? 'available' : result === false ? 'unavailable' : 'unknown');
+      timer = setTimeout(() => check(currentGeneration), STATUS_POLL_INTERVAL_MS);
+    };
+    const refresh = (nextState: string | null | undefined) => {
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      setInternetStatus('checking');
+      if ((!nextState || nextState === 'active') && !isActionInFlight) void check(generation);
+    };
+    refresh(AppState.currentState);
+    const subscription = AppState.addEventListener('change', refresh);
+    return () => {
+      active = false;
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      subscription.remove();
+    };
+  }, [isActionInFlight]);
 
   // Picker modal state
   const [isPickerOpen, setIsPickerOpen] = useState(false);
@@ -432,9 +467,9 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
             <Text style={styles.settingsItemText}>🗑️ Clear Servers from Keychain</Text>
           </Pressable>
           <View style={styles.dropdownDivider} />
-          <Pressable style={styles.signOutBtn} onPress={handleSignOut}>
+          {/*<Pressable style={styles.signOutBtn} onPress={handleSignOut}>
             <Text style={styles.signOutText}>Sign Out</Text>
-          </Pressable>
+          </Pressable> */}
         </View>
       )}
 
@@ -503,6 +538,19 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
           >
             {buttonStateText}
           </Text>
+          <View style={styles.internetStatusRow} accessibilityLiveRegion="polite">
+            <View style={[
+              styles.internetStatusDot,
+              internetStatus === 'available' && styles.internetAvailable,
+              internetStatus === 'unavailable' && styles.internetUnavailable,
+            ]} />
+            <Text style={styles.internetStatusText}>
+              {internetStatus === 'available' ? 'Internet available'
+                : internetStatus === 'unavailable' ? 'Internet unavailable'
+                  : internetStatus === 'checking' ? 'Checking internet…'
+                    : 'Unable to check internet'}
+            </Text>
+          </View>
         </View>
 
         {/* Current Location Row (Tappable to open picker) */}
@@ -598,7 +646,7 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
                             handleDeleteServer(c.servers[0]);
                           }}
                         >
-                          <Text style={styles.deleteServerText}>Delete</Text>
+                          <Text style={styles.deleteServerText}>🗑</Text>
                         </Pressable>
                       )}
                       <Text style={styles.chevron}>›</Text>
@@ -663,7 +711,7 @@ export default function HomeScreen({ onLogout, onOpenAdmin }: HomeScreenProps) {
                               handleDeleteServer(item.server);
                             }}
                           >
-                            <Text style={styles.deleteServerText}>Delete</Text>
+                            <Text style={styles.deleteServerText}>🗑</Text>
                           </Pressable>
                           {isRankingLoading && item.latencyMs === null ? (
                             <ActivityIndicator size="small" color="#6366F1" />
@@ -740,7 +788,7 @@ const styles = StyleSheet.create({
   },
   settingsDropdown: {
     position: 'absolute',
-    top: 55,
+    top: 105,
     right: 20,
     backgroundColor: COLORS.cardBg,
     borderRadius: 12,
@@ -1084,6 +1132,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: COLORS.textSecondary,
   },
+  internetStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 10,
+  },
+  internetStatusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#94A3B8',
+    marginRight: 8,
+  },
+  internetAvailable: { backgroundColor: '#22C55E' },
+  internetUnavailable: { backgroundColor: '#EF4444' },
+  internetStatusText: { color: '#CBD5E1', fontSize: 14 },
   deleteServerText: {
     color: '#EF4444',
     fontSize: 14,

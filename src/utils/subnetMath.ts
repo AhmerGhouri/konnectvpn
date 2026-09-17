@@ -39,10 +39,16 @@ export function computeNetworkAndGateway(
     throw new Error(`Invalid prefix length in CIDR: "${cidrAddress}"`);
   }
 
+  // WireGuard DNS may list IPv4 and IPv6 resolvers; RouterOS network needs one IPv4 address.
+  const dnsGateway = dnsFallback?.split(',').map((value) => value.trim()).find((value) => {
+    const octets = value.split('.');
+    return octets.length === 4 && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255);
+  });
+
   // For /32 point-to-point host routes, the network address in RouterOS is the remote peer / gateway
   // (typically 10.2.0.1 in Proton VPN) so RouterOS creates an on-link connected route to the peer.
   if (prefix === 32) {
-    const gw = dnsFallback || '10.2.0.1';
+    const gw = dnsGateway || '10.2.0.1';
     return {
       network: gw,
       gateway: gw,
@@ -59,6 +65,6 @@ export function computeNetworkAndGateway(
 
   return {
     network: intToIp(netInt),
-    gateway: dnsFallback || intToIp(gwInt),
+    gateway: dnsGateway || intToIp(gwInt),
   };
 }

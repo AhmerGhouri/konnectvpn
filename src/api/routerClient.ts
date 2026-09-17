@@ -3,7 +3,7 @@
 // Networking layer for the MikroTik router REST API.
 // Implements Single-Policy Overwrite Architecture (wg-konnect).
 // Exactly one WireGuard interface, one peer, one address, one NAT rule, and 3 routes.
-// Switching servers overwrites the configuration in place with zero policy conflicts.
+// Switching servers removes the app-managed policy before recreating it.
 
 import * as Keychain from 'react-native-keychain';
 import {
@@ -390,7 +390,7 @@ export async function switchServer(serverId: string): Promise<void> {
     throw new RouterAuthError();
   }
 
-  console.log('[switchServer] Overwriting single-policy with server:', serverId);
+  console.log('[switchServer] Replacing single-policy with server:', serverId);
 
   // 1. Retrieve WireGuard config
   const config = await getServerWireGuardConfig(serverId);
@@ -405,11 +405,42 @@ export async function switchServer(serverId: string): Promise<void> {
   if (!routesRes.ok) {
     throw new RouterScriptError(`Failed to fetch routes: HTTP ${routesRes.status}`);
   }
-  const routes: any[] = await routesRes.json();
+  let routes: any[] = await routesRes.json();
   const wanGateway = getWanDefaultGateway(routes);
   if (!wanGateway) {
     throw new RouterScriptError('Could not find an active WAN default route. Ensure router is connected to the internet.');
   }
+
+  // Remove the previous app-managed policy before creating the selected one.
+  // Read all affected resources first so a failed read cannot start a partial cleanup.
+  const policyComments = [KONNECT_SPLIT1_COMMENT, KONNECT_SPLIT2_COMMENT, KONNECT_ENDPOINT_COMMENT];
+  const policyResources: { path: string; items: any[] }[] = [{
+    path: '/rest/ip/route',
+    items: routes.filter((route) => policyComments.includes(String(route.comment || ''))),
+  }];
+  for (const resource of [
+    { path: '/rest/interface/wireguard/peers', matches: (item: any) => item.interface === KONNECT_WG_INTERFACE },
+    { path: '/rest/ip/address', matches: (item: any) => item.interface === KONNECT_WG_INTERFACE && item.dynamic !== 'true' },
+    { path: '/rest/ip/firewall/nat', matches: (item: any) => item.comment === KONNECT_NAT_COMMENT },
+    { path: '/rest/interface/wireguard', matches: (item: any) => item.name === KONNECT_WG_INTERFACE },
+  ]) {
+    const response = await routerFetch(resource.path, { method: 'GET' }, creds);
+    if (!response.ok) {
+      throw new RouterScriptError(`Failed to read existing VPN policy: HTTP ${response.status}`);
+    }
+    const items: any[] = await response.json();
+    policyResources.push({ path: resource.path, items: items.filter(resource.matches) });
+  }
+  for (const resource of policyResources) {
+    for (const item of resource.items) {
+      const response = await routerFetch(`${resource.path}/${item['.id']}`, { method: 'DELETE' }, creds);
+      if (!response.ok) {
+        throw new RouterScriptError(`Failed to remove existing VPN policy: HTTP ${response.status}`);
+      }
+    }
+  }
+  // Do not reuse deleted route IDs in the existing creation flow below.
+  routes = routes.filter((route) => !policyComments.includes(String(route.comment || '')));
 
   // 3. Overwrite / Ensure WireGuard Interface (wg-konnect)
   const ifacesRes = await routerFetch('/rest/interface/wireguard', { method: 'GET' }, creds);
@@ -506,7 +537,7 @@ export async function switchServer(serverId: string): Promise<void> {
 
   if (mainPeer) {
     console.log(`[switchServer] Updating peer on ${KONNECT_WG_INTERFACE} (${mainPeer['.id']})`);
-    await routerFetch(
+    const response = await routerFetch(
       `/rest/interface/wireguard/peers/${mainPeer['.id']}`,
       {
         method: 'PATCH',
@@ -515,9 +546,13 @@ export async function switchServer(serverId: string): Promise<void> {
       },
       creds,
     );
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      throw new RouterScriptError(`Failed to configure WireGuard peer: ${error?.detail || error?.message || `HTTP ${response.status}`}`);
+    }
   } else {
     console.log(`[switchServer] Creating peer on ${KONNECT_WG_INTERFACE}`);
-    await routerFetch(
+    const response = await routerFetch(
       '/rest/interface/wireguard/peers',
       {
         method: 'PUT',
@@ -526,6 +561,10 @@ export async function switchServer(serverId: string): Promise<void> {
       },
       creds,
     );
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      throw new RouterScriptError(`Failed to configure WireGuard peer: ${error?.detail || error?.message || `HTTP ${response.status}`}`);
+    }
   }
 
   // 5. Overwrite / Ensure IP Address on wg-konnect
@@ -558,7 +597,7 @@ export async function switchServer(serverId: string): Promise<void> {
 
   if (mainAddr) {
     console.log(`[switchServer] Updating IP address on ${KONNECT_WG_INTERFACE} (${mainAddr['.id']})`);
-    await routerFetch(
+    const response = await routerFetch(
       `/rest/ip/address/${mainAddr['.id']}`,
       {
         method: 'PATCH',
@@ -567,9 +606,13 @@ export async function switchServer(serverId: string): Promise<void> {
       },
       creds,
     );
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      throw new RouterScriptError(`Failed to configure VPN address: ${error?.detail || error?.message || `HTTP ${response.status}`}`);
+    }
   } else {
     console.log(`[switchServer] Creating IP address on ${KONNECT_WG_INTERFACE}`);
-    await routerFetch(
+    const response = await routerFetch(
       '/rest/ip/address',
       {
         method: 'PUT',
@@ -578,6 +621,10 @@ export async function switchServer(serverId: string): Promise<void> {
       },
       creds,
     );
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      throw new RouterScriptError(`Failed to configure VPN address: ${error?.detail || error?.message || `HTTP ${response.status}`}`);
+    }
   }
 
   // 6. Overwrite / Ensure NAT masquerade rule for wg-konnect
@@ -745,7 +792,14 @@ export async function switchServer(serverId: string): Promise<void> {
     if (mangleRes.ok) {
       const mangleList: any[] = await mangleRes.json();
       const mssRule = mangleList.find((m) => String(m.comment || '') === 'konnect-vpn-mss');
-      if (!mssRule) {
+      if (mssRule) {
+        // Recreating wg-konnect changes its internal ID; rebind the existing rule.
+        await routerFetch(`/rest/ip/firewall/mangle/${mssRule['.id']}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 'out-interface': KONNECT_WG_INTERFACE }),
+        }, creds);
+      } else {
         await routerFetch(
           '/rest/ip/firewall/mangle',
           {
@@ -971,12 +1025,12 @@ export async function getConnectionStatus(): Promise<ConnectionStatus> {
 
   const split1 = Array.isArray(routes)
     ? routes.find((r) => {
-        const comment = String(r.comment || '');
-        return (
-          (comment === KONNECT_SPLIT1_COMMENT || comment.startsWith('vpn-split1-')) &&
-          !isItemDisabled(r)
-        );
-      })
+      const comment = String(r.comment || '');
+      return (
+        (comment === KONNECT_SPLIT1_COMMENT || comment.startsWith('vpn-split1-')) &&
+        !isItemDisabled(r)
+      );
+    })
     : null;
 
   if (!split1) {
@@ -1092,6 +1146,30 @@ export async function pingServer(endpointIp: string): Promise<number | null> {
   } catch {
     return null;
   }
+}
+
+/** Check internet reachability from the router, independently of VPN handshake status. */
+export async function checkRouterInternet(): Promise<boolean | null> {
+  const creds = await getStoredCredentials();
+  if (!creds) return null;
+  let completedChecks = 0;
+  for (const address of ['1.1.1.1', '8.8.8.8']) {
+    try {
+      const response = await routerFetch('/rest/ping', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address, count: '1' }),
+      }, creds);
+      if (!response.ok) continue;
+      const results = await response.json();
+      if (!Array.isArray(results) || results.length === 0) continue;
+      if (results.some((result) => Number(result.received) > 0)) return true;
+      if (results.some((result) => Number(result.sent) > 0)) completedChecks += 1;
+    } catch {
+      // A router/API error is not proof that the router has no internet.
+    }
+  }
+  return completedChecks === 2 ? false : null;
 }
 
 /**
@@ -1211,4 +1289,3 @@ export async function provisionServer(params: {
     newServerEntry,
   );
 }
-

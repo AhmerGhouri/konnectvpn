@@ -9,7 +9,7 @@
 # ==============================================================================
 
 # 1. Ensure LAN REST API service is active (HTTP on port 80)
-/ip service set www address=172.20.0.0/20,192.168.0.0/16 port=80 disabled=no
+/ip service set www address=192.168.180.0/24,192.168.180.0/24 port=80 disabled=no
 
 # 2. WireGuard Interface for UK London 1 (Listen Port: 13233)
 /interface/wireguard add name="wg-uk-london-1" listen-port=13233 private-key="YBwztI7YkagZvksDJB5oOYNufsFQc/pXgYHYAgK4REM=" comment="uk-london-1"
@@ -26,7 +26,7 @@
 # 6. Policy Split Routes (Disabled by default, enabled when user connects)
 /ip/route add dst-address=0.0.0.0/1 gateway=10.2.0.1%wg-uk-london-1 comment="vpn-split1-uk-london-1" disabled=yes
 /ip/route add dst-address=128.0.0.0/1 gateway=10.2.0.1%wg-uk-london-1 comment="vpn-split2-uk-london-1" disabled=yes
-/ip/route add dst-address=149.40.48.106/32 gateway=172.20.0.1 comment="vpn-endpoint-uk-london-1" disabled=yes
+/ip/route add dst-address=149.40.48.106/32 gateway=192.168.110.1 comment="vpn-endpoint-uk-london-1" disabled=yes
 
 # 7. Helper scripts (Optional - the app handles switching via REST API natively)
 /system/script add name="switch-vpn" source=":local targetServer \$serverId;\r\n:foreach r in=[/ip route find where comment~\"vpn-split1\"] do={\r\n  :local comm [/ip route get \$r comment];\r\n  :if (\$comm~\"vpn-split1-\" . \$targetServer) do={\r\n    /ip route enable \$r;\r\n  } else={\r\n    /ip route disable \$r;\r\n  }\r\n};\r\n:foreach r in=[/ip route find where comment~\"vpn-split2\"] do={\r\n  :local comm [/ip route get \$r comment];\r\n  :if (\$comm~\"vpn-split2-\" . \$targetServer) do={\r\n    /ip route enable \$r;\r\n  } else={\r\n    /ip route disable \$r;\r\n  }\r\n};\r\n:foreach r in=[/ip route find where comment~\"vpn-endpoint\"] do={\r\n  :local comm [/ip route get \$r comment];\r\n  :if (\$comm~\"vpn-endpoint-\" . \$targetServer) do={\r\n    /ip route enable \$r;\r\n  } else={\r\n    /ip route disable \$r;\r\n  }\r\n}"
